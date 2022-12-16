@@ -1,0 +1,164 @@
+from pyspark.sql.functions import *
+from pyspark.ml.feature import HashingTF, IDF, Tokenizer, RegexTokenizer
+from pyspark.ml.feature import StringIndexer, StopWordsRemover
+from pyspark.ml import Pipeline
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.sql.types import DoubleType
+import io
+import matplotlib.pyplot as plt
+import s3fs
+import pandas as pd
+import boto3
+sc.setLogLevel("ERROR")
+
+columns = ['review_id', 'product_title', 'star_rating', 'review_headline', 'review_body', 'review_date']
+sdf = spark.read.csv('s3://amazon-reviews-pds/tsv/amazon_reviews_us_H*_v1_00.tsv.gz', sep='\t', header=True, inferSchema= True)
+sdf = sdf.select(*columns)
+sdf = sdf.na.drop(subset=["star_rating", "review_body", "review_date"])
+
+#Plot reviews by month and year 
+
+sdf = sdf.withColumn("review_year", year(col("review_date")))
+sdf = sdf.withColumn("review_month", month(col("review_date")))
+sdf = sdf.withColumn("review_yearmonth", date_format(col("review_date"), "yyyy-MM"))
+
+df = sdf.where(col("review_year") > 2012).groupby("review_yearmonth").count().sort("review_yearmonth").toPandas()
+myplot = df.plot.bar('review_yearmonth','count')
+myplot.set(xlabel='Year-Month', ylabel='Number of Reviews')
+myplot.set(title='Number of Reviews by Year and Month')
+myplot.figure.set_tight_layout('tight')
+
+img_data = io.BytesIO()
+plt.savefig(img_data, format='png', bbox_inches='tight')
+img_data.seek(0)
+s3 = s3fs.S3FileSystem(anon=False)
+with s3.open('s3://reviews-bucket-zz/H_reviews_Date.png', 'wb') as f:
+    f.write(img_data.getbuffer())
+
+#Plot star rating
+
+star_counts_df = sdf.groupby('star_rating').count().sort('star_rating').toPandas()
+
+fig = plt.figure()
+plt.bar(star_counts_df['star_rating'],star_counts_df['count'] )
+plt.title("Review Count by Star Rating")
+img_data = io.BytesIO()
+plt.savefig(img_data, format='png', bbox_inches='tight')
+img_data.seek(0)
+s3 = s3fs.S3FileSystem(anon=False)
+with s3.open('s3://reviews-bucket-zz/H_StarRating.png', 'wb') as f:
+    f.write(img_data.getbuffer())
+
+#Plot word frequency 
+
+def ascii_only(mystring):
+    if mystring:
+        return mystring.encode('ascii', 'ignore').decode('ascii')
+    else:
+        return None
+
+ascii_udf = udf(ascii_only)
+sdf = sdf.withColumn("clean_review_headline", ascii_udf('review_headline'))
+sdf = sdf.withColumn("clean_review_body", ascii_udf('review_body'))
+sdf = sdf.withColumn('clean_review_body', regexp_replace(sdf.clean_review_body, '[_():;,.!?\\-]', ''))
+sdf = sdf.withColumn("rating_converted", when(col("star_rating") > 3, 1.0).otherwise(0.0))
+
+stopwordList = ['i', 'i\'ve', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your', 'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her', 'hers', 'herself', 'it', 'its', 'itself', 'they', 'them', 'their', 'theirs', 'themselves', 'what', 'which', 'who', 'whom', 'this', 'that', 'these', 'those', 'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'having', 'do', 'does', 'did', 'doing', 'a', 'an', 'the', 'and', 'but', 'if', 'or', 'because', 'as', 'until', 'while', 'of', 'at', 'by', 'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'in', 'out', 'on', 'off', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'can', 'will', 'just', 'don', 'should', 'now']
+
+regexTokenizer = RegexTokenizer(inputCol="clean_review_body", outputCol="clean_review_words", 
+                                pattern="\\w+", gaps=False)
+remove_sw = StopWordsRemover(inputCol="clean_review_words", outputCol="clean").setStopWords(stopwordList)
+pipeline = Pipeline(stages=[regexTokenizer, remove_sw])
+
+
+pipelineFit = pipeline.fit(sdf)
+sdf = pipelineFit.transform(sdf)
+
+sdf = sdf.withColumn("clean",concat_ws(",",col("clean")))
+
+music_wc_df = sdf.withColumn('word', explode(split(col('clean'), ' '))).groupBy(
+    'word').count().sort('count', ascending=False).limit(20).toPandas()
+
+myplot = music_wc_df.plot.bar('word','count')
+myplot.set(xlabel='Word', ylabel='Frequency')
+myplot.set(title='Word Count')
+myplot.figure.set_tight_layout('tight')
+img_data = io.BytesIO()
+plt.savefig(img_data, format='png', bbox_inches='tight')
+img_data.seek(0)
+s3 = s3fs.S3FileSystem(anon=False)
+with s3.open('s3://reviews-bucket-zz/Music_WordCount_regex.png', 'wb') as f:
+    f.write(img_data.getbuffer())
+
+# Filter for bad reviews 
+sdf_bad = sdf.select('clean').filter(sdf.rating_converted == 0)
+
+bad_music_wc_df = sdf_bad.withColumn('word', explode(split(col('clean'), ' '))).groupBy(
+    'word').count().sort('count', ascending=False).limit(20).toPandas()
+
+     
+myplot = bad_music_wc_df.plot.bar('word','count')
+myplot.set(xlabel='Word', ylabel='Frequency')
+myplot.set(title='Word Count')
+myplot.figure.set_tight_layout('tight')
+img_data = io.BytesIO()
+plt.savefig(img_data, format='png', bbox_inches='tight')
+img_data.seek(0)
+s3 = s3fs.S3FileSystem(anon=False)
+with s3.open('s3://reviews-bucket-zz/BadMusic_WordCount.png', 'wb') as f:
+    f.write(img_data.getbuffer())
+
+hashtf = HashingTF(numFeatures=2**16, inputCol="sw_review_words", outputCol='tf')
+idf = IDF(inputCol='tf', outputCol="features", minDocFreq=5) 
+label_stringIdx = StringIndexer(inputCol = "rating_converted", outputCol = "label")
+lr = LogisticRegression(maxIter=10)
+pipeline = Pipeline(stages=[regexTokenizer, remove_sw, hashtf, idf, label_stringIdx, lr])
+
+
+grid = ParamGridBuilder()
+grid = grid.addGrid(lr.regParam, [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]) 
+grid = grid.addGrid(lr.elasticNetParam, [0, 0.5, 1])
+grid = grid.build()
+
+print('Number of models to be tested: ', len(grid))
+
+evaluator = BinaryClassificationEvaluator(metricName="areaUnderROC")
+cv = CrossValidator(estimator=pipeline, estimatorParamMaps=grid, evaluator=evaluator, numFolds=3,seed=789)
+cv  = cv.fit(trainingData)
+
+predictions = cv.transform(testData)
+auc = evaluator.evaluate(predictions)
+print('AUC:', auc)
+
+predictions.groupby('label').pivot('prediction').count().fillna(0).show()
+cm = predictions.groupby('label').pivot('prediction').count().fillna(0).collect()
+def calculate_precision_recall(cm): 
+    tn = cm[0][1]
+    fp = cm[0][2]
+    fn = cm[1][1]
+    tp = cm[1][2]
+    precision = tp / ( tp + fp )
+    recall = tp / ( tp + fn )
+    accuracy = ( tp + tn ) / ( tp + tn + fp + fn )
+    f1_score = 2 * ( ( precision * recall ) / ( precision + recall ) ) 
+    return accuracy, precision, recall, f1_score
+
+print( calculate_precision_recall(cm) )
+
+parammap = cv.bestModel.stages[3].extractParamMap()
+for p, v in parammap.items():
+    print(p, v)
+
+mymodel = cv.bestModel.stages[3]
+
+plt.figure(figsize=(6,6))
+plt.plot([0, 1], [0, 1], 'r--')
+x = mymodel.summary.roc.select('FPR').collect() 
+y = mymodel.summary.roc.select('TPR').collect() 
+plt.scatter(x, y)
+plt.xlabel('False Positive Rate') 
+plt.ylabel('True Positive Rate') 
+plt.title("ROC Curve")
+
